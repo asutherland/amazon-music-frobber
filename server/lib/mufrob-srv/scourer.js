@@ -111,6 +111,10 @@ Scourer.prototype = {
         var albumTitle = relAttrs.Title;
         // (could be Various Artists)
         var albumArtistName = relAttrs.Creator['#'];
+
+        // skip tracks missing images...
+        if (!rawTrack.LargeImage)
+          continue;
         // we are assuming this holds the same for all tracks
         var albumImage = {
           url: rawTrack.LargeImage.URL,
