@@ -20,7 +20,7 @@ define(
   ) {
 const when = $Q.when;
 
-const MAX_PAGES_TO_CONSUME = 50;
+const MAX_PAGES_TO_CONSUME = 10;
 
 /**
  * Deal with the eccentricities of the Amazon search API to build our useful
@@ -181,14 +181,17 @@ Scourer.prototype = {
                                            trackDate, true);
           album.putTrack(track);
         }
+      }
+      else {
+        console.error("WEIRD PAGE", $util.inspect(resp, false, 12));
+      }
 
-        // -- get more pages?
-        var totalPages = parseInt(resp.TotalPages);
-        if (pageNum < totalPages &&
-            pageNum < MAX_PAGES_TO_CONSUME) {
-          console.log("pageNum", pageNum, "totalPages", totalPages);
-          return self._scourPage(pageNum + 1);
-        }
+      // -- get more pages?
+      var totalPages = parseInt(resp.TotalPages);
+      if (pageNum < totalPages &&
+          pageNum < MAX_PAGES_TO_CONSUME) {
+        console.log("pageNum", pageNum, "totalPages", totalPages);
+        return self._scourPage(pageNum + 1);
       }
 
       // -- perform any fixup required
