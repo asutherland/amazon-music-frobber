@@ -159,12 +159,19 @@ parser.command('asin')
       position: 1,
       default: null,
     },
+    relationshipType: {
+      string: "--reltype",
+      default: 'AuthorityTitle',
+      help: "RelationshipType, examples include: AuthorityTitle, " +
+        "DigitalMusicPrimaryArtist, Tracks",
+    },
   })
   .callback(function(options) {
     console.log("(in asin command)");
     applyGlobalOptions(options);
     require(['mufrob-srv/searcher'], function($searcher) {
-      when($searcher.doASINLookup(options.searchString), function() {
+      when($searcher.doASINLookup(options.searchString,
+                                  options.relationshipType), function() {
         process.exit(0);
       }, function(err) {
         console.error("ERR:", err);

@@ -63,6 +63,15 @@ const MAX_PAGES_TO_CONSUME = 50;
  *    album info.
  * - Keep doing that for pages until we run out of pages or we hit diminshing
  *    returns or we hit an internal hardcoded limit.
+ *
+ *
+ * NEW NOTE, 2011/11/06, merge in with the above soon...
+ *
+ * Multi-disc albums are not being handled properly by our current strategy.  It
+ *  appears we will need to observe the DOWNLOADABLE_MUSIC_ALBUM entry and
+ *  follow it's 'Children' relationship of type 'Tracks' which appears to
+ *  include all the entries, although we will need to page and infer by the
+ *  track index renumbering happening.
  */
 function Scourer() {
   this.searcher = new $searcher.Searcher();
@@ -88,69 +97,193 @@ Scourer.prototype = {
                                      $searcher.SORT_RELEVANCE, pageNum),
                 function(resp) {
       console.log("  got page data:", pageNum);
-      var rawTracks = resp.Item, artists = self.artists;
-      for (var iTrack = 0; iTrack < rawTracks.length; iTrack++) {
-        //console.error();
-        //console.error("!!!!! track",$util.inspect(rawTracks[iTrack], false, 12));
-        var rawTrack = rawTracks[iTrack],
-            attrs = rawTrack.ItemAttributes;
-        // ignore things which are not tracks; for example, the artist can
-        //  show up in here...
-        if (attrs.ProductTypeName !== 'DOWNLOADABLE_MUSIC_TRACK') {
-          //console.log("skipping", attrs);
-          continue;
+
+
+      if (resp.hasOwnProperty("Item") && resp.Item) {
+        var rawItems = resp.Item, artists = self.artists;
+        for (var iItem = 0; iItem < rawItems.length; iItem++) {
+          //console.error();
+          //console.error("!!!!! track",$util.inspect(rawItems[iItem], false, 12));
+          var rawItem = rawItems[iItem],
+              attrs = rawItem.ItemAttributes,
+              albumArtistName, albumArtist, albumASIN, albumTitle, albumImage,
+              album;
+          // -- Album Processing
+          if (attrs.ProductTypeName === 'DOWNLOADABLE_MUSIC_ALBUM') {
+            albumArtistName = attrs.Creator['#'];
+            albumASIN = rawItem.ASIN;
+            albumTitle = attrs.Title;
+
+            albumImage = {
+              url: rawItem.LargeImage.URL,
+              width: parseInt(rawItem.LargeImage.Width['#']),
+              height: parseInt(rawItem.LargeImage.Height['#']),
+            };
+
+            albumArtist = artists.getOrCreateArtist(albumArtistName);
+            album = albumArtist.getOrCreateAlbum(albumASIN, albumTitle,
+                                                 albumImage);
+
+            album.__knownTrackCount =
+              parseInt(rawItem.RelatedItems.RelatedItemCount);
+
+            // but no more processing...
+            continue;
+          }
+          // -- Ignore non-albums, non-tracks
+          else if (attrs.ProductTypeName !== 'DOWNLOADABLE_MUSIC_TRACK') {
+            //console.log("skipping", attrs);
+            continue;
+          }
+
+          var relItem = rawItem.RelatedItems.RelatedItem.Item,
+              relAttrs = relItem.ItemAttributes;
+
+          // -- pick useful fields out
+          var artistName = attrs.Creator['#'];
+
+          albumASIN = relItem.ASIN;
+          albumTitle = relAttrs.Title;
+          // (could be Various Artists)
+          albumArtistName = relAttrs.Creator['#'];
+
+          // skip tracks missing images...
+          if (!rawItem.LargeImage)
+            continue;
+          // we are assuming this holds the same for all tracks
+          albumImage = {
+            url: rawItem.LargeImage.URL,
+            width: parseInt(rawItem.LargeImage.Width['#']),
+            height: parseInt(rawItem.LargeImage.Height['#']),
+          };
+
+          var trackASIN = rawItem.ASIN;
+          var trackTitle = attrs.Title;
+          var trackNum = parseInt(attrs.TrackSequence);
+          var trackLength = parseInt(attrs.RunningTime['#']);
+          var trackDate = new Date(attrs.ReleaseDate);
+
+          // -- populate datamodel
+          albumArtist = artists.getOrCreateArtist(albumArtistName);
+          var trackArtist = artists.getOrCreateArtist(artistName);
+
+          console.log("Seeing", albumArtistName, "|", artistName, "|",
+                      trackTitle);
+
+          album = albumArtist.getOrCreateAlbum(albumASIN, albumTitle,
+                                               albumImage);
+          // assume tracks are all on disc 1; we'll do a fixup pass if this
+          //  turns out to be wrong.
+          var discNum = 1;
+          var track = new $datamodel.Track(album, trackArtist, trackASIN,
+                                           discNum,
+                                           trackNum, trackTitle, trackLength,
+                                           trackDate, true);
+          album.putTrack(track);
         }
 
-        var relItem = rawTrack.RelatedItems.RelatedItem.Item,
-            relAttrs = relItem.ItemAttributes;
+        // -- get more pages?
+        var totalPages = parseInt(resp.TotalPages);
+        if (pageNum < totalPages &&
+            pageNum < MAX_PAGES_TO_CONSUME) {
+          console.log("pageNum", pageNum, "totalPages", totalPages);
+          return self._scourPage(pageNum + 1);
+        }
+      }
 
-        // -- pick useful fields out
-        var artistName = attrs.Creator['#'];
+      // -- perform any fixup required
+      var albumsRequiringFixup = self.artists.getAlbumsRequiringFixup();
+      return self._fixupAlbums(albumsRequiringFixup);
+    });
+  },
 
-        var albumASIN = relItem.ASIN;
-        var albumTitle = relAttrs.Title;
-        // (could be Various Artists)
-        var albumArtistName = relAttrs.Creator['#'];
+  _fixupAlbum: function(album, item) {
 
-        // skip tracks missing images...
-        if (!rawTrack.LargeImage)
-          continue;
-        // we are assuming this holds the same for all tracks
-        var albumImage = {
-          url: rawTrack.LargeImage.URL,
-          width: parseInt(rawTrack.LargeImage.Width['#']),
-          height: parseInt(rawTrack.LargeImage.Height['#']),
-        };
+console.log("fixup album:", album.title, album.tracks.length);
+    // - build a map from ASIN to track
+    var tracksByASIN = {}, iTrack, track;
+    for (iTrack = 0; iTrack < album.tracks.length; iTrack++) {
+      track = album.tracks[iTrack];
+      if (!track)
+        continue;
+      tracksByASIN[track.ASIN] = track;
+    }
+    for (iTrack = 0; iTrack < album._needFixup; iTrack++) {
+      track = album._needFixup[iTrack];
+      if (!track)
+        continue;
+      tracksByASIN[track.ASIN] = track;
+    }
 
+    // - nuke the current track setup
+    album.__resetTracks();
+
+    // - process the received explicit track ordering
+    var discNum = 1, lastTrackNum = 0,
+        rawTracks = item.RelatedItems.RelatedItem;
+
+    // some albums (ex: "Saturdays = Youth [+Digital Booklet]") do not have a
+    //  sane ordering by default.  Detect them by observing the first index is
+    //  not 1.
+    var suspectOrdering = rawTracks[0].Item.ItemAttributes.TrackSequence !== '1';
+
+    for (iTrack = 0; iTrack < rawTracks.length; iTrack++) {
+      var rawTrack = rawTracks[iTrack].Item;
+      var trackNum = parseInt(rawTrack.ItemAttributes.TrackSequence);
+      if (trackNum < lastTrackNum && !suspectOrdering)
+        discNum++;
+
+      if (!tracksByASIN.hasOwnProperty(rawTrack.ASIN)) {
+        // it's possible for us to miss out on tracks, so create them on demand
+        console.log("  Unknown track", rawTrack.ASIN,
+                     rawTrack.ItemAttributes.TrackSequence,
+                     rawTrack.ItemAttributes.Title);
+        var attrs = rawTrack.ItemAttributes;
         var trackASIN = rawTrack.ASIN;
         var trackTitle = attrs.Title;
-        var trackNum = parseInt(attrs.TrackSequence);
         var trackLength = parseInt(attrs.RunningTime['#']);
         var trackDate = new Date(attrs.ReleaseDate);
 
-        // -- populate datamodel
-        var albumArtist = artists.getOrCreateArtist(albumArtistName);
-        var trackArtist = artists.getOrCreateArtist(artistName);
+        var artistName = attrs.Creator['#'];
+        var trackArtist = this.artists.getOrCreateArtist(artistName);
 
-        console.log("Seeing", albumArtistName, "|", artistName, "|", trackTitle);
-
-        var album = albumArtist.getOrCreateAlbum(albumASIN, albumTitle,
-                                                 albumImage);
-        var track = new $datamodel.Track(album, trackArtist, trackASIN,
-                                         trackNum, trackTitle, trackLength,
-                                         trackDate);
-        album.putTrack(track);
+        track = new $datamodel.Track(album, trackArtist, trackASIN,
+                                     discNum,
+                                     trackNum, trackTitle, trackLength,
+                                     trackDate, false);
+      }
+      else {
+        track = tracksByASIN[rawTrack.ASIN];
       }
 
-      // -- get more pages?
-      var totalPages = parseInt(resp.TotalPages);
-      if (pageNum < totalPages &&
-          pageNum < MAX_PAGES_TO_CONSUME) {
-        console.log("pageNum", pageNum, "totalPages", totalPages);
-        return self._scourPage(pageNum + 1);
+      // - fixup the disc number and place the track
+      track.disc = discNum;
+      album.putTrack(track);
+
+      lastTrackNum = trackNum;
+    }
+  },
+
+  _fixupAlbums: function _fixupAlbums(albums) {
+    var curBunch, self = this;
+    function gotAlbumData(items) {
+      if (items) {
+        for (var i = 0; i < curBunch.length; i++) {
+          self._fixupAlbum(curBunch[i], items[i]);
+        }
       }
-      return artists;
-    });
+      if (albums.length) {
+        curBunch = albums.splice(0, 10);
+        var asins = curBunch.map(function(a) { return a.ASIN; });
+        console.log("== fixing up albums");
+        return when(
+          self.searcher.multipageLookup(asins, 'Tracks'),
+          gotAlbumData);
+      }
+      return self.artists;
+    }
+
+    return gotAlbumData(null);
   },
 };
 
@@ -171,14 +304,17 @@ exports.cmdScour = function(phrase) {
         console.log();
         console.log("  Album:", album.title);
 
-        for (var iTrack = 0; iTrack < album.tracks.length; iTrack++) {
-          var track = album.tracks[iTrack];
-          if (track) {
-            var otherArtistBit = "";
-            if (track.artist !== artist) {
-              otherArtistBit = "(" + track.artist.name + ")";
+        for (var iDisc = 0; iDisc < album.discs.length; iDisc++) {
+          var tracks = album.discs[iDisc];
+          for (var iTrack = 0; iTrack < tracks.length; iTrack++) {
+            var track = tracks[iTrack];
+            if (track) {
+              var otherArtistBit = "";
+              if (track.artist !== artist) {
+                otherArtistBit = "(" + track.artist.name + ")";
+              }
+              console.log("   ", track.num, "-", track.title, otherArtistBit);
             }
-            console.log("   ", track.num, "-", track.title, otherArtistBit);
           }
         }
       }

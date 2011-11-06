@@ -132,7 +132,15 @@ Searcher.prototype = {
    */
   _queueSearch: function(cacheName, params, deferred) {
     this._queryQueue.push(
-      { type: 'search', cacheName: cacheName, params: params,
+      { type: 'ItemSearch', cacheName: cacheName, params: params,
+        deferred: deferred });
+    if (this._activeTimeout === null)
+      this._runNextQueued();
+  },
+
+  _queueLookup: function(cacheName, params, deferred) {
+    this._queryQueue.push(
+      { type: 'ItemLookup', cacheName: cacheName, params: params,
         deferred: deferred });
     if (this._activeTimeout === null)
       this._runNextQueued();
@@ -146,7 +154,7 @@ Searcher.prototype = {
         self._runNextQueued();
     }, THROTTLE_MS);
 
-    this._opHelper.execute('ItemSearch', action.params,
+    this._opHelper.execute(action.type, action.params,
                            function(error, results) {
       if (error) {
         action.deferred.reject(error);
@@ -161,6 +169,93 @@ Searcher.prototype = {
       // - resolve contents
       action.deferred.resolve(results.Items);
     });
+  },
+
+  lookup: function(asins, relationshipType, page) {
+    if (Array.isArray(asins))
+      asins = asins.join(',');
+    var deferred = $Q.defer(), self = this;
+    if (!page)
+      page = 1;
+
+    var cacheName = 'l:' + asins + ':' + relationshipType + ':' + page;
+    this._redis.get(cacheName, function(err, result) {
+      // - use the cached result if we got it and it's still valid
+      if (result) {
+        var respObj = JSON.parse(result);
+        var validAsOf = new Date(self._pickoutArg(respObj, 'Timestamp'));
+        var respAgeMS = Date.now() - validAsOf.valueOf();
+        if (respAgeMS < MAX_DATA_AGE_MS) {
+          deferred.resolve(respObj.Items);
+          return;
+        }
+      }
+
+      // - no (usable) cache, issue a query.
+      var params = {
+        ItemId: asins,
+        ResponseGroup: 'ItemAttributes,Images,RelatedItems',
+        RelationshipType: relationshipType,
+        RelatedItemPage: page,
+      };
+      self._queueLookup(cacheName, params, deferred);
+    });
+
+    return deferred.promise;
+  },
+
+  /**
+   * Perform a potentially multi-page lookup on an item, reissuing with higher
+   *  RelatedItemPage indices and building an aggregate representation.
+   */
+  multipageLookup: function(asins, relationshipType) {
+    var self = this, nextPage = 1;
+
+    var resultItems = [];
+    function processPage(reqItems) {
+      //console.error("  page", (nextPage - 1), "returned",
+      //              $util.inspect(reqItems, false, 12));
+      var morePagesNeeded = false;
+      var items = reqItems.Item;
+      if (!Array.isArray(items))
+        items = [items];
+      for (var iItem = 0; iItem < items.length; iItem++) {
+        var srcItem = items[iItem];
+        //console.error("srcItem", srcItem);
+
+        // - figure out if more pages are needed
+        var itemRelPage = parseInt(srcItem.RelatedItems.RelatedItemPage),
+            itemRelPageCount =
+              parseInt(srcItem.RelatedItems.RelatedItemPageCount);
+        if (itemRelPage < itemRelPageCount)
+          morePagesNeeded = true;
+        else if (itemRelPage > itemRelPageCount)
+          continue;
+
+        // - if this is our first page, no concatenation required
+        if (nextPage === 2) {
+          resultItems.push(srcItem);
+          continue;
+        }
+
+        // - concatenate
+        var resItem = resultItems[iItem],
+            resRelated = resItem.RelatedItems.RelatedItem,
+            srcRelated = srcItem.RelatedItems.RelatedItem;
+
+        resItem.RelatedItems.RelatedItem = resRelated.concat(srcRelated);
+      }
+
+      if (morePagesNeeded) {
+        console.log("  Issuing query for related page", nextPage);
+        return when(self.lookup(asins, relationshipType, nextPage++),
+                    processPage);
+      }
+      return resultItems;
+    }
+
+    console.log("  Issuing query for related page", nextPage);
+    return when(this.lookup(asins, relationshipType, nextPage++), processPage);
   },
 
   //////////////////////////////////////////////////////////////////////////////
@@ -225,20 +320,18 @@ exports.doSearch = function(phrase) {
   });
 };
 
-exports.doASINLookup = function(asins) {
+exports.doASINLookup = function(asins, relationshipType) {
   var searcher = new Searcher();
-  var params = {
-    ItemId: asins,
-    ResponseGroup: 'ItemAttributes,Images,RelatedItems',
-    // == Relationship types:
-    // - AuthorityTitle does not seem to work here either
-    // - DigitalMusicPrimaryArtist - does not seem to work
-    // - Tracks - returns the album tracks well enough (ASIN/title/number)
-    //   (ProductTypeName: 'DOWNLOADABLE_MUSIC_TRACK')
-    RelationshipType: 'AuthorityTitle',
-  };
+  // == Relationship types:
+  // - AuthorityTitle does not seem to work here either
+  // - DigitalMusicPrimaryArtist - does not seem to work
+  // - Tracks - returns the album tracks well enough (ASIN/title/number)
+  //   (ProductTypeName: 'DOWNLOADABLE_MUSIC_TRACK')
+  if (!relationshipType)
+    relationshipType = 'AuthorityTitle';
   console.log("ASIN lookup(s) on", asins);
-  return when(searcher.rawLookup(params), function(results) {
+  return when(searcher.multipageLookup(asins,
+                                       relationshipType), function(results) {
     console.error("results:");
     console.error($util.inspect(results, false, 12));
   });
